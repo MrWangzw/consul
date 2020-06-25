@@ -36,6 +36,15 @@ type Intention struct {
 	// Action is whether this is an allowlist or denylist intention.
 	Action IntentionAction
 
+	// RouteMatches is the list of additional L7 route aspects that must match
+	// for the intention Action to apply.
+	//
+	// This is only valid for an "allow" action value above. (TODO)
+	//
+	// Requests that fail to match any of the provided routes will do the
+	// opposite of the Action value.
+	RouteMatches []IntentionRouteMatch `json:",omitempty"`
+
 	// DefaultAddr is not used.
 	// Deprecated: DefaultAddr is not used and may be removed in a future version.
 	DefaultAddr string `json:",omitempty"`
@@ -65,6 +74,37 @@ type Intention struct {
 
 	CreateIndex uint64
 	ModifyIndex uint64
+}
+
+type IntentionRouteMatch struct {
+	HTTP *IntentionRouteHTTPMatch // required
+}
+
+type IntentionRouteHTTPMatch struct {
+	PathExact  string `json:",omitempty" alias:"path_exact"`
+	PathPrefix string `json:",omitempty" alias:"path_prefix"`
+	PathRegex  string `json:",omitempty" alias:"path_regex"`
+
+	Header     []IntentionRouteHTTPMatchHeader     `json:",omitempty"`
+	QueryParam []IntentionRouteHTTPMatchQueryParam `json:",omitempty" alias:"query_param"`
+	Methods    []string                            `json:",omitempty"`
+}
+
+type IntentionRouteHTTPMatchHeader struct {
+	Name    string
+	Present bool   `json:",omitempty"`
+	Exact   string `json:",omitempty"`
+	Prefix  string `json:",omitempty"`
+	Suffix  string `json:",omitempty"`
+	Regex   string `json:",omitempty"`
+	Invert  bool   `json:",omitempty"`
+}
+
+type IntentionRouteHTTPMatchQueryParam struct {
+	Name    string
+	Present bool   `json:",omitempty"`
+	Exact   string `json:",omitempty"`
+	Regex   string `json:",omitempty"`
 }
 
 // String returns human-friendly output describing ths intention.

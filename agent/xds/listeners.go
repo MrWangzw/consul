@@ -313,8 +313,16 @@ func (s *Server) makeIngressGatewayListeners(address string, cfgSnap *proxycfg.C
 		} else {
 			// If multiple upstreams share this port, make a special listener for the protocol.
 			listener := makeListener(listenerKey.Protocol, address, listenerKey.Port)
-			filter, err := makeListenerFilter(
-				true, listenerKey.Protocol, listenerKey.RouteName(), "", "ingress_upstream_", "", false)
+			filter, err := makeListenerFilter(listenerFilterOpts{
+				useRDS:          true,
+				protocol:        listenerKey.Protocol,
+				filterName:      listenerKey.RouteName(),
+				cluster:         "",
+				statPrefix:      "ingress_upstream_",
+				routePath:       "",
+				ingress:         false,
+				httpAuthzFilter: nil, // TODO(l7-ixn)
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -395,14 +403,9 @@ func makeListenerFromUserConfig(configJSON string) (*envoy.Listener, error) {
 	return &l, err
 }
 
-// Ensure that the first filter in each filter chain of a public listener is the
-// authz filter to prevent unauthorized access and that every filter chain uses
-// our TLS certs. We might allow users to work around this later if there is a
-// good use case but this is actually a feature for now as it allows them to
-// specify custom listener params in config but still get our certs delivered
-// dynamically and intentions enforced without coming up with some complicated
-// templating/merging solution.
-func (s *Server) injectConnectFilters(cfgSnap *proxycfg.ConfigSnapshot, token string, listener *envoy.Listener, setTLS bool) error {
+// Ensure that the first filter in each filter chain of a public listener is
+// the authz filter to prevent unauthorized access.
+func (s *Server) injectConnectFilters(cfgSnap *proxycfg.ConfigSnapshot, token string, listener *envoy.Listener) error {
 	authFilter, err := makeExtAuthFilter(token)
 	if err != nil {
 		return err
@@ -422,6 +425,17 @@ func (s *Server) injectConnectFilters(cfgSnap *proxycfg.ConfigSnapshot, token st
 				// authFilter,
 			}, listener.FilterChains[idx].Filters...)
 
+	}
+	return nil
+}
+
+// Ensure that every filter chain uses our TLS certs. We might allow users to
+// work around this later if there is a good use case but this is actually a
+// feature for now as it allows them to specify custom listener params in
+// config but still get our certs delivered dynamically and intentions enforced
+// without coming up with some complicated templating/merging solution.
+func (s *Server) injectConnectTLSOnFilterChains(cfgSnap *proxycfg.ConfigSnapshot, listener *envoy.Listener) error {
+	for idx := range listener.FilterChains {
 		listener.FilterChains[idx].TlsContext = &envoyauth.DownstreamTlsContext{
 			CommonTlsContext:         makeCommonTLSContextFromLeaf(cfgSnap, cfgSnap.Leaf()),
 			RequireClientCertificate: &wrappers.BoolValue{Value: true},
@@ -449,6 +463,10 @@ func (s *Server) makePublicListener(cfgSnap *proxycfg.ConfigSnapshot, token stri
 		// In the happy path don't return yet as we need to inject TLS config still.
 	}
 
+	// This controls if we do L4 or L7 intention checks.
+	// TODO(l7-ixn): when using the listener escape hatch figure out how to make l7 auth work
+	useHTTPFilter := false
+
 	if l == nil {
 		// No user config, use default listener
 		addr := cfgSnap.Address
@@ -468,10 +486,33 @@ func (s *Server) makePublicListener(cfgSnap *proxycfg.ConfigSnapshot, token stri
 			port = cfg.BindPort
 		}
 
+		switch cfg.Protocol {
+		case "http", "http2", "grpc":
+			useHTTPFilter = true
+		default:
+			useHTTPFilter = false
+		}
+
 		l = makeListener(PublicListenerName, addr, port)
 
-		filter, err := makeListenerFilter(
-			false, cfg.Protocol, "public_listener", LocalAppClusterName, "", "", true)
+		opts := listenerFilterOpts{
+			useRDS:     false,
+			protocol:   cfg.Protocol,
+			filterName: "public_listener",
+			cluster:    LocalAppClusterName,
+			statPrefix: "",
+			routePath:  "",
+			ingress:    true,
+		}
+
+		if useHTTPFilter {
+			// TODO(l7-ixn + rbac-ixn)
+			opts.httpAuthzFilter, err = makeRBACHTTPFilter(cfgSnap, s.Logger)
+			if err != nil {
+				return nil, err
+			}
+		}
+		filter, err := makeListenerFilter(opts)
 		if err != nil {
 			return nil, err
 		}
@@ -484,8 +525,17 @@ func (s *Server) makePublicListener(cfgSnap *proxycfg.ConfigSnapshot, token stri
 		}
 	}
 
-	err = s.injectConnectFilters(cfgSnap, token, l, true)
-	return l, err
+	if !useHTTPFilter {
+		if err := s.injectConnectFilters(cfgSnap, token, l); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.injectConnectTLSOnFilterChains(cfgSnap, l); err != nil {
+		return nil, err
+	}
+
+	return l, nil
 }
 
 func (s *Server) makeExposedCheckListener(cfgSnap *proxycfg.ConfigSnapshot, cluster string, path structs.ExposePath) (proto.Message, error) {
@@ -515,7 +565,17 @@ func (s *Server) makeExposedCheckListener(cfgSnap *proxycfg.ConfigSnapshot, clus
 
 	filterName := fmt.Sprintf("exposed_path_filter_%s_%d", strippedPath, path.ListenerPort)
 
-	f, err := makeListenerFilter(false, path.Protocol, filterName, cluster, "", path.Path, true)
+	// TODO(l7-ixn):maybe?
+	f, err := makeListenerFilter(listenerFilterOpts{
+		useRDS:          false,
+		protocol:        path.Protocol,
+		filterName:      filterName,
+		cluster:         cluster,
+		statPrefix:      "",
+		routePath:       path.Path,
+		ingress:         true,
+		httpAuthzFilter: nil, // TODO(l7-ixn)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -792,8 +852,16 @@ func (s *Server) makeUpstreamListenerForDiscoveryChain(
 		clusterName = CustomizeClusterName(target.Name, chain)
 	}
 
-	filter, err := makeListenerFilter(
-		useRDS, cfg.Protocol, upstreamID, clusterName, "upstream_", "", false)
+	filter, err := makeListenerFilter(listenerFilterOpts{
+		useRDS:          useRDS,
+		protocol:        cfg.Protocol,
+		filterName:      upstreamID,
+		cluster:         clusterName,
+		statPrefix:      "upstream_",
+		routePath:       "",
+		ingress:         false,
+		httpAuthzFilter: nil, // TODO(l7-ixn)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -856,26 +924,37 @@ func getAndModifyUpstreamConfigForListener(logger hclog.Logger, u *structs.Upstr
 	return cfg
 }
 
-func makeListenerFilter(
-	useRDS bool,
-	protocol, filterName, cluster, statPrefix, routePath string, ingress bool) (*envoylistener.Filter, error) {
+type listenerFilterOpts struct {
+	useRDS          bool
+	protocol        string
+	filterName      string
+	cluster         string
+	statPrefix      string
+	routePath       string
+	ingress         bool
+	httpAuthzFilter *envoyhttp.HttpFilter
+}
 
-	switch protocol {
+func makeListenerFilter(opts listenerFilterOpts) (*envoylistener.Filter, error) {
+	switch opts.protocol {
 	case "grpc":
-		return makeHTTPFilter(useRDS, filterName, cluster, statPrefix, routePath, ingress, true, true)
+		return makeHTTPFilter(opts.useRDS, opts.filterName, opts.cluster, opts.statPrefix, opts.routePath, opts.ingress, true, true, opts.httpAuthzFilter)
 	case "http2":
-		return makeHTTPFilter(useRDS, filterName, cluster, statPrefix, routePath, ingress, false, true)
+		return makeHTTPFilter(opts.useRDS, opts.filterName, opts.cluster, opts.statPrefix, opts.routePath, opts.ingress, false, true, opts.httpAuthzFilter)
 	case "http":
-		return makeHTTPFilter(useRDS, filterName, cluster, statPrefix, routePath, ingress, false, false)
+		return makeHTTPFilter(opts.useRDS, opts.filterName, opts.cluster, opts.statPrefix, opts.routePath, opts.ingress, false, false, opts.httpAuthzFilter)
 	case "tcp":
 		fallthrough
 	default:
-		if useRDS {
+		if opts.useRDS {
 			return nil, fmt.Errorf("RDS is not compatible with the tcp proxy filter")
-		} else if cluster == "" {
+		} else if opts.routePath != "" {
+			return nil, fmt.Errorf("route path is not compatible with the tcp proxy filter")
+		} else if opts.cluster == "" {
 			return nil, fmt.Errorf("cluster name is required for a tcp proxy filter")
 		}
-		return makeTCPProxyFilter(filterName, cluster, statPrefix)
+		// TODO(ingress): warn if ingress is configured for tcp?
+		return makeTCPProxyFilter(opts.filterName, opts.cluster, opts.statPrefix)
 	}
 }
 
@@ -913,6 +992,7 @@ func makeHTTPFilter(
 	useRDS bool,
 	filterName, cluster, statPrefix, routePath string,
 	ingress, grpc, http2 bool,
+	authzFilter *envoyhttp.HttpFilter,
 ) (*envoylistener.Filter, error) {
 	op := envoyhttp.HttpConnectionManager_Tracing_INGRESS
 	if !ingress {
@@ -1002,8 +1082,16 @@ func makeHTTPFilter(
 		cfg.Http2ProtocolOptions = &envoycore.Http2ProtocolOptions{}
 	}
 
+	// Like injectConnectFilters for L4, here we ensure that the first filter
+	// (other than the "envoy.grpc_http1_bridge" filter) in the http filter
+	// chain of a public listener is the authz filter to prevent unauthorized
+	// access and that every filter chain uses our TLS certs.
+	if authzFilter != nil {
+		cfg.HttpFilters = append([]*envoyhttp.HttpFilter{authzFilter}, cfg.HttpFilters...)
+	}
+
 	if grpc {
-		// Add grpc bridge before router
+		// Add grpc bridge before router and authz
 		cfg.HttpFilters = append([]*envoyhttp.HttpFilter{{
 			Name:       "envoy.grpc_http1_bridge",
 			ConfigType: &envoyhttp.HttpFilter_Config{Config: &pbstruct.Struct{}},
@@ -1049,6 +1137,20 @@ func makeFilter(name string, cfg proto.Message) (*envoylistener.Filter, error) {
 	return &envoylistener.Filter{
 		Name:       name,
 		ConfigType: &envoylistener.Filter_Config{Config: cfgStruct},
+	}, nil
+}
+
+func makeEnvoyHTTPFilter(name string, cfg proto.Message) (*envoyhttp.HttpFilter, error) {
+	// Ridiculous dance to make that struct into pbstruct.Struct by... encoding it
+	// as JSON and decoding again!!
+	cfgStruct, err := conversion.MessageToStruct(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &envoyhttp.HttpFilter{
+		Name:       name,
+		ConfigType: &envoyhttp.HttpFilter_Config{Config: cfgStruct},
 	}, nil
 }
 

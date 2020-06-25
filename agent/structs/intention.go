@@ -3,6 +3,7 @@ package structs
 import (
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,15 @@ type Intention struct {
 	// Action is whether this is an allowlist or denylist intention.
 	Action IntentionAction
 
+	// RouteMatches is the list of additional L7 route aspects that must match
+	// for the intention Action to apply.
+	//
+	// This is only valid for an "allow" action value above. (TODO)
+	//
+	// Requests that fail to match any of the provided routes will do the
+	// opposite of the Action value.
+	RouteMatches []IntentionRouteMatch `json:",omitempty"`
+
 	// DefaultAddr is not used.
 	// Deprecated: DefaultAddr is not used and may be removed in a future version.
 	DefaultAddr string `bexpr:"-" codec:",omitempty"`
@@ -85,6 +95,91 @@ type Intention struct {
 	RaftIndex `bexpr:"-"`
 }
 
+type IntentionRouteMatch struct {
+	HTTP *IntentionRouteHTTPMatch // required
+
+	// If we have non-http match criteria for other protocols in the future
+	// (gRPC, redis, etc) they can go here.
+}
+
+func (x *IntentionRouteMatch) AddToHash(h hash.Hash) {
+	if x.HTTP != nil {
+		x.HTTP.AddToHash(h)
+	}
+}
+
+type IntentionRouteHTTPMatch struct {
+	PathExact  string `json:",omitempty"`
+	PathPrefix string `json:",omitempty"`
+	PathRegex  string `json:",omitempty"` // NOTE: this is envoy-flavored-regex
+
+	Header     []IntentionRouteHTTPMatchHeader     `json:",omitempty"`
+	QueryParam []IntentionRouteHTTPMatchQueryParam `json:",omitempty"` // TODO: remove this
+	Methods    []string                            `json:",omitempty"`
+}
+
+func (x *IntentionRouteHTTPMatch) AddToHash(h hash.Hash) {
+	h.Write([]byte(x.PathExact))
+	h.Write([]byte(x.PathPrefix))
+	h.Write([]byte(x.PathRegex))
+
+	for _, hdr := range x.Header {
+		hdr.AddToHash(h)
+	}
+	for _, qp := range x.QueryParam {
+		qp.AddToHash(h)
+	}
+	for _, m := range x.Methods {
+		h.Write([]byte(m))
+	}
+}
+
+type IntentionRouteHTTPMatchHeader struct {
+	Name    string
+	Present bool   `json:",omitempty"`
+	Exact   string `json:",omitempty"`
+	Prefix  string `json:",omitempty"`
+	Suffix  string `json:",omitempty"`
+	Regex   string `json:",omitempty"` // NOTE: this is envoy-flavored-regex
+	Invert  bool   `json:",omitempty"`
+}
+
+func (x *IntentionRouteHTTPMatchHeader) AddToHash(h hash.Hash) {
+	h.Write([]byte(x.Name))
+	if x.Present {
+		h.Write([]byte("present"))
+	} else {
+		h.Write([]byte("absent"))
+	}
+	h.Write([]byte(x.Exact))
+	h.Write([]byte(x.Prefix))
+	h.Write([]byte(x.Suffix))
+	h.Write([]byte(x.Regex))
+	if x.Invert {
+		h.Write([]byte("invert"))
+	} else {
+		h.Write([]byte("identity"))
+	}
+}
+
+type IntentionRouteHTTPMatchQueryParam struct {
+	Name    string
+	Present bool   `json:",omitempty"`
+	Exact   string `json:",omitempty"`
+	Regex   string `json:",omitempty"`
+}
+
+func (x *IntentionRouteHTTPMatchQueryParam) AddToHash(h hash.Hash) {
+	h.Write([]byte(x.Name))
+	if x.Present {
+		h.Write([]byte("present"))
+	} else {
+		h.Write([]byte("absent"))
+	}
+	h.Write([]byte(x.Exact))
+	h.Write([]byte(x.Regex))
+}
+
 func (t *Intention) UnmarshalJSON(data []byte) (err error) {
 	type Alias Intention
 	aux := &struct {
@@ -107,8 +202,8 @@ func (t *Intention) UnmarshalJSON(data []byte) (err error) {
 
 // SetHash calculates Intention.Hash from any mutable "content" fields.
 //
-// The Hash is primarily used for replication to determine if a token
-// has changed and should be updated locally.
+// The Hash is really only used for replication to determine if an
+// intention has changed and should be updated locally.
 //
 // TODO: move to agent/consul where it is called
 func (x *Intention) SetHash() {
@@ -145,7 +240,38 @@ func (x *Intention) SetHash() {
 		hash.Write([]byte(x.Meta[k]))
 	}
 
+	for _, routeMatch := range x.RouteMatches {
+		routeMatch.AddToHash(hash)
+	}
+
 	x.Hash = hash.Sum(nil)
+}
+
+func (x *Intention) Normalize() error {
+	// Default source type
+	if x.SourceType == "" {
+		x.SourceType = IntentionSourceConsul
+	}
+
+	// Set the precedence
+	x.UpdatePrecedence()
+
+	for _, routeMatch := range x.RouteMatches {
+		if routeMatch.HTTP == nil {
+			continue
+		}
+
+		httpMatch := routeMatch.HTTP
+		if len(httpMatch.Methods) == 0 {
+			continue
+		}
+
+		for j := 0; j < len(httpMatch.Methods); j++ {
+			httpMatch.Methods[j] = strings.ToUpper(httpMatch.Methods[j])
+		}
+	}
+
+	return nil
 }
 
 // Validate returns an error if the intention is invalid for inserting
@@ -235,6 +361,89 @@ func (x *Intention) Validate() error {
 	default:
 		result = multierror.Append(result, fmt.Errorf(
 			"SourceType must be set to 'consul'"))
+	}
+
+	for i, routeMatch := range x.RouteMatches {
+		if routeMatch.HTTP == nil {
+			result = multierror.Append(result, fmt.Errorf(
+				"RouteMatches[%d].HTTP must be set", i))
+			continue
+		}
+
+		pathParts := 0
+		if routeMatch.HTTP.PathExact != "" {
+			pathParts++
+			if !strings.HasPrefix(routeMatch.HTTP.PathExact, "/") {
+				return fmt.Errorf("RouteMatches[%d] PathExact doesn't start with '/': %q", i, routeMatch.HTTP.PathExact)
+			}
+		}
+		if routeMatch.HTTP.PathPrefix != "" {
+			pathParts++
+			if !strings.HasPrefix(routeMatch.HTTP.PathPrefix, "/") {
+				return fmt.Errorf("RouteMatches[%d] PathPrefix doesn't start with '/': %q", i, routeMatch.HTTP.PathPrefix)
+			}
+		}
+		if routeMatch.HTTP.PathRegex != "" {
+			pathParts++
+		}
+		if pathParts > 1 {
+			return fmt.Errorf("RouteMatches[%d] should only contain at most one of PathExact or PathPrefix", i)
+		}
+
+		for j, hdr := range routeMatch.HTTP.Header {
+			if hdr.Name == "" {
+				return fmt.Errorf("RouteMatches[%d] Header[%d] missing required Name field", i, j)
+			}
+			hdrParts := 0
+			if hdr.Present {
+				hdrParts++
+			}
+			if hdr.Exact != "" {
+				hdrParts++
+			}
+			if hdr.Regex != "" {
+				hdrParts++
+			}
+			if hdr.Prefix != "" {
+				hdrParts++
+			}
+			if hdr.Suffix != "" {
+				hdrParts++
+			}
+			if hdrParts != 1 {
+				return fmt.Errorf("RouteMatches[%d] Header[%d] should only contain one of Present, Exact, Prefix, Suffix, or Regex", i, j)
+			}
+		}
+
+		for j, qm := range routeMatch.HTTP.QueryParam {
+			if qm.Name == "" {
+				return fmt.Errorf("RouteMatches[%d] QueryParam[%d] missing required Name field", i, j)
+			}
+
+			qmParts := 0
+			if qm.Present {
+				qmParts++
+			}
+			if qm.Exact != "" {
+				qmParts++
+			}
+			if qm.Regex != "" {
+				qmParts++
+			}
+			if qmParts != 1 {
+				return fmt.Errorf("RouteMatches[%d] QueryParam[%d] should only contain one of Present, Exact, or Regex", i, j)
+			}
+		}
+
+		if len(routeMatch.HTTP.Methods) > 0 {
+			found := make(map[string]struct{})
+			for _, m := range routeMatch.HTTP.Methods {
+				if _, ok := found[m]; ok {
+					return fmt.Errorf("RouteMatches[%d] Methods contains %q more than once", i, m)
+				}
+				found[m] = struct{}{}
+			}
+		}
 	}
 
 	return result
@@ -338,6 +547,8 @@ func (x *Intention) EstimateSize() int {
 	for k, v := range x.Meta {
 		size += len(k) + len(v)
 	}
+
+	// TODO(l7-ixns)
 
 	return size
 }
